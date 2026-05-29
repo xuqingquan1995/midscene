@@ -14,16 +14,18 @@
 ### 1.1 主流程控制（Explorer Orchestrator）
 
 - 设备连接与信息获取
-  - 连接 adb device（可选 remote adb）
+  - 连接 adb device（可选 remote adb）；连接动作由主控负责，可直接使用 `@midscene/android` 的 `AndroidDevice`（本质仍是 adb 管理）
   - 获取当前 Activity（作为唯一页面 id）
   - 截图并落盘
 - 视觉分析
   - 输入：两张截图（上一张 + 最新一张）+ 当前 Activity + 配置与提示词
-  - 输出：结构化协议（见第 4 节），包含可操作元素列表（可定位描述、动作建议、概率）与弹窗处理建议
+  - 输出：结构化协议（见第 4 节），包含：
+    - 页面可操作元素列表（可定位描述、动作建议、概率）与弹窗处理建议
+    - 两张截图是否一致的判断结果（用于判定上一动作是否生效）
 - 决策与执行调度
   - 依据弹窗优先级规则、最小可信度阈值、已操作去重、每页最大有效操作次数、最大深度（以 Activity 图最短路径）选择下一步动作
   - 调用 Midscene 执行层完成实际操作
-  - 操作后再次截图并与上一张做对比，判定“操作是否生效”
+  - “操作是否生效”由视觉模型在分析两张截图时给出结论（主控不做本地 hash/SSIM 判定）
 - 状态持久化（实时、同步）
   - 维护 `pages.json`（按 Activity 聚合）
   - 维护 `graph.mmd`（仅记录导致 Activity 变化的边）
@@ -107,6 +109,11 @@
 ```json
 {
   "activityFullName": "com.example.app.MainActivity",
+  "uiDiff": {
+    "sameAsPrev": false,
+    "confidence": 0.92,
+    "reason": "页面内容发生变化，列表出现新结果"
+  },
   "popup": {
     "hasPopup": true,
     "popupType": "permission | exit_confirm | upgrade_ad | tip_overlay | none | unknown",
@@ -141,6 +148,9 @@
 ```
 
 约束要求：
+- `uiDiff.sameAsPrev` 用于判定“上一动作是否生效”：
+  - `sameAsPrev=false` 表示两张截图不一致，视为上一动作在 UI 层面生效
+  - 首步或无上一截图时，主控可令 `prevScreenshot=currScreenshot`，此时 `sameAsPrev` 应为 `true`
 - `describeForLocate` 必须“可定位”：同文案多处出现时必须加位置（例如“屏幕下半部分第二个‘确定’按钮”）
 - 图标必须描述语义或形态/颜色（例如“右上角齿轮形灰色设置图标”）
 - `probability` 取值范围 `[0, 1]`
@@ -166,31 +176,31 @@
 
 ### 6.1 每轮固定流水线（同步落盘）
 
-1) 获取 `currentActivity`（adb）
+1) 获取 `currentActivity`（adb，主控负责，可通过 midscene 的 AndroidDevice/agent 所在链路拿到相关能力）
 2) 采集 `currScreenshot` 并落盘（按命名规则）
-3) 准备 `prevScreenshot`（若是首步，则 prev=curr 或使用一张空占位策略）
-4) 调用视觉模型：输入两张截图 + activity + 规则，得到输出协议 JSON
-5) 更新 `pages.json`（合并到该 Activity 对象中）
-6) 动作决策：
+3) 准备 `prevScreenshot`（若是首步，则 prev=curr）
+4) 调用视觉模型：输入两张截图 + activity + 规则，得到输出协议 JSON（包含 `uiDiff.sameAsPrev`）
+5) 基于 `uiDiff.sameAsPrev` 回写“上一动作是否生效”
+   - 若 `sameAsPrev=false`：上一动作视为 UI 生效，给“上一动作所在页面”的 `effectiveOpsCount + 1`
+   - 若 `sameAsPrev=true`：上一动作视为无效操作，不消耗 `maxEffectiveOpsPerPage` 配额；下一次回到同页时优先尝试下一个候选元素
+6) 更新 `pages.json`（将当前 Activity 的截图、弹窗与元素列表合并到该 Activity 对象中；并同步回写上一动作的 attempt 记录）
+7) 动作决策：
    - 若 `popup.hasPopup=true`：优先执行 `popup.recommended`
    - 否则从 `elements` 按 probability 降序挑选，过滤：
      - `< minActionProbability` 的候选
      - 已标记 `operated=true` 的元素
      - `attempts >= maxAttemptsPerElement` 的元素
      - 当前页面 `effectiveOpsCount >= maxEffectiveOpsPerPage` 时不再尝试新元素
-7) 调用 Midscene 执行选中动作
-8) 执行后立即重新截图得到 `afterScreenshot`（作为下一轮的 `currScreenshot`），并与上一张截图做“是否生效”判断：
-   - 若 `afterScreenshot` 与执行前 `currScreenshot` 不一致：视为“有效操作”，将该 Activity 的 `effectiveOpsCount + 1`
-   - 若一致：视为“无效操作”，不消耗 `effectiveOpsCount` 配额，转而尝试下一个候选元素
-9) 判定页面跳转：
-   - 重新获取 `afterActivity`（adb）
+8) 调用 Midscene 执行选中动作
+9) 判定页面跳转（执行动作后立刻获取一次 Activity，用于本轮 attempt 与图更新；UI 生效由下一轮视觉模型的 `uiDiff` 判定）
+   - 获取 `afterActivity`（adb）
    - 若 `afterActivity != currentActivity`：更新 Mermaid 图（增加一条边）
-10) 进入下一轮
+10) 进入下一轮（下一轮会用 `prevScreenshot=currScreenshot`、`currScreenshot=新截图` 来判断本轮动作是否生效）
 
 ### 6.2 “截图不一致”判定方法（建议）
 
-- 一期可用简单稳定策略：对两张图做缩放后计算感知 hash 或结构相似度（SSIM）阈值判断
-- 结果仅用于“是否生效”的配额统计与候选切换，不作为页面变化依据（页面变化只看 Activity）
+- 截图一致性判断由视觉模型输出 `uiDiff.sameAsPrev` 给出
+- 该结果仅用于“是否生效”的配额统计与候选切换，不作为页面变化依据（页面变化只看 Activity）
 
 ## 7. 实时数据持久化（pages.json + graph.mmd）
 
@@ -385,17 +395,34 @@ await agent.aiScroll(undefined, { scrollType: 'singleAction', direction: 'down' 
 ## 13. 主控核心伪代码（便于落地实现）
 
 ```ts
+let lastDecision: null | { elementId: string; simpleDesc: string; action: string; beforeActivity: string } = null;
+let lastBeforeActivity: null | string = null;
+let lastCurrScreenshotPath: null | string = null;
+
 while (!globalDone) {
   const beforeActivity = await adbGetActivity();
-  const beforeShot = await captureAndSave(stepId, beforeActivity, currentElementSimpleDesc ?? '扫描');
+  const beforeShot = await captureAndSave(stepId, beforeActivity, lastDecision?.simpleDesc ?? '扫描');
 
   const analysis = await visionAnalyze({
-    prevScreenshotPath,
+    prevScreenshotPath: prevScreenshotPath ?? beforeShot.path,
     currScreenshotPath: beforeShot.path,
     activityFullName: beforeActivity,
     homeActivityFullName,
     extraPrompt
   });
+
+  if (lastDecision && lastBeforeActivity && lastCurrScreenshotPath) {
+    const uiEffective = analysis.uiDiff?.sameAsPrev === false;
+    const afterActivity = beforeActivity;
+    const activityChanged = afterActivity !== lastBeforeActivity;
+    updateAttemptRecord(lastBeforeActivity, lastDecision, { uiEffective, afterActivity, activityChanged });
+    if (uiEffective) {
+      incEffectiveOpsCount(lastBeforeActivity);
+    }
+    if (activityChanged) {
+      appendMermaidEdge(lastBeforeActivity, afterActivity, lastDecision);
+    }
+  }
 
   upsertPagesJson(beforeActivity, beforeShot, analysis);
 
@@ -411,23 +438,10 @@ while (!globalDone) {
 
   await executeByMidscene(agent, decision);
 
-  const afterShot = await captureAndSave(stepId + 1, beforeActivity, decision.simpleDesc);
-  const uiEffective = compareScreenshot(beforeShot.path, afterShot.path) === 'different';
-
-  const afterActivity = await adbGetActivity();
-  const activityChanged = afterActivity !== beforeActivity;
-
-  updateAttemptRecord(beforeActivity, decision, { uiEffective, afterActivity, activityChanged });
-
-  if (activityChanged) {
-    appendMermaidEdge(beforeActivity, afterActivity, decision);
-  } else if (!uiEffective) {
-    markDecisionAsIneffectiveAndTryNextCandidate(beforeActivity, decision);
-  } else {
-    incEffectiveOpsCount(beforeActivity);
-  }
-
-  prevScreenshotPath = afterShot.path;
+  lastDecision = decision;
+  lastBeforeActivity = beforeActivity;
+  lastCurrScreenshotPath = beforeShot.path;
+  prevScreenshotPath = beforeShot.path;
   stepId += 1;
 }
 ```
@@ -443,4 +457,3 @@ while (!globalDone) {
 - `graph.mmd` 实时更新且只记录 Activity 变化的边
 - `maxEffectiveOpsPerPage` 不被“无效操作”消耗
 - 主页禁止 back 生效，能通过“重启 + 路径回放”继续未完成页面探索
-
