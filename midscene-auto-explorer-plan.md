@@ -25,7 +25,7 @@
 - 决策与执行调度
   - 依据弹窗优先级规则、最小可信度阈值、已操作去重、每页最大有效操作次数、最大深度（以 Activity 图最短路径）选择下一步动作
   - 调用 Midscene 执行层完成实际操作
-  - “操作是否生效”由视觉模型在分析两张截图时给出结论（主控不做本地 hash/SSIM 判定）
+  - “操作是否生效”由视觉模型在分析两张截图时给出结论（主控不做本地相似度计算）
 - 状态持久化（实时、同步）
   - 维护 `pages.json`（按 Activity 聚合）
   - 维护 `graph.mmd`（仅记录导致 Activity 变化的边）
@@ -63,6 +63,7 @@
   - `maxEffectiveOpsPerPage`：单页面最大“有效操作”次数上限（仅当操作生效才 +1）
   - `maxAttemptsPerElement`：单元素最大尝试次数
   - `topKCandidates`：每轮候选 top-k
+  - `screenshotSimilarityThreshold`：截图相似度阈值（`similarity >= threshold` 判定为“一致”，否则“不一致”）
 - 视觉提示词扩展
   - `extraPrompt`：外部追加提示词，拼接到默认提示词之后
 
@@ -111,6 +112,7 @@
   "activityFullName": "com.example.app.MainActivity",
   "uiDiff": {
     "sameAsPrev": false,
+    "similarity": 0.41,
     "confidence": 0.92,
     "reason": "页面内容发生变化，列表出现新结果"
   },
@@ -149,6 +151,7 @@
 
 约束要求：
 - `uiDiff.sameAsPrev` 用于判定“上一动作是否生效”：
+  - `sameAsPrev` 由视觉模型基于 `uiDiff.similarity` 与配置的 `screenshotSimilarityThreshold` 推导：`sameAsPrev = (similarity >= threshold)`
   - `sameAsPrev=false` 表示两张截图不一致，视为上一动作在 UI 层面生效
   - 首步或无上一截图时，主控可令 `prevScreenshot=currScreenshot`，此时 `sameAsPrev` 应为 `true`
 - `describeForLocate` 必须“可定位”：同文案多处出现时必须加位置（例如“屏幕下半部分第二个‘确定’按钮”）
@@ -179,8 +182,8 @@
 1) 获取 `currentActivity`（adb，主控负责，可通过 midscene 的 AndroidDevice/agent 所在链路拿到相关能力）
 2) 采集 `currScreenshot` 并落盘（按命名规则）
 3) 准备 `prevScreenshot`（若是首步，则 prev=curr）
-4) 调用视觉模型：输入两张截图 + activity + 规则，得到输出协议 JSON（包含 `uiDiff.sameAsPrev`）
-5) 基于 `uiDiff.sameAsPrev` 回写“上一动作是否生效”
+4) 调用视觉模型：输入两张截图 + activity + 规则 + `screenshotSimilarityThreshold`，得到输出协议 JSON（包含 `uiDiff.sameAsPrev` 与 `uiDiff.similarity`）
+5) 基于 `uiDiff.sameAsPrev` 回写“上一动作是否生效”（`sameAsPrev` 已由视觉模型按阈值推导）
    - 若 `sameAsPrev=false`：上一动作视为 UI 生效，给“上一动作所在页面”的 `effectiveOpsCount + 1`
    - 若 `sameAsPrev=true`：上一动作视为无效操作，不消耗 `maxEffectiveOpsPerPage` 配额；下一次回到同页时优先尝试下一个候选元素
 6) 更新 `pages.json`（将当前 Activity 的截图、弹窗与元素列表合并到该 Activity 对象中；并同步回写上一动作的 attempt 记录）
@@ -199,7 +202,7 @@
 
 ### 6.2 “截图不一致”判定方法（建议）
 
-- 截图一致性判断由视觉模型输出 `uiDiff.sameAsPrev` 给出
+- 截图一致性判断必须由视觉模型给出：输出 `uiDiff.similarity`（0-1）并按配置的 `screenshotSimilarityThreshold` 判定 `uiDiff.sameAsPrev`
 - 该结果仅用于“是否生效”的配额统计与候选切换，不作为页面变化依据（页面变化只看 Activity）
 
 ## 7. 实时数据持久化（pages.json + graph.mmd）
